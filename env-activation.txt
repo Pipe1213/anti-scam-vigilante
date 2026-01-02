@@ -1,0 +1,7 @@
+# activate enviroment
+
+    - source venv/bin/activate 
+
+# start server
+    - uvicorn main:app --reload
+    - ngrok http 8000
