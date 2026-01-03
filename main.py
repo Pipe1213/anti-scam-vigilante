@@ -2,7 +2,9 @@ import os
 import json
 import asyncio
 import base64
+
 from dotenv import load_dotenv
+from groq import Groq
 
 # Load the API Key
 load_dotenv()
@@ -17,8 +19,10 @@ from deepgram import (
     DeepgramClientOptions,
     LiveTranscriptionEvents,
     LiveOptions,
+    SpeakOptions, 
 )
 
+import asyncio
 
 #### Initialize the application ####
 
@@ -197,31 +201,120 @@ async def get_token():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print(">> Connection accepted. Waiting for audio...")
-
-    # Connect to Deepgram
     
+    # Get the current Async Event Loop
+    
+    loop = asyncio.get_event_loop()
+    
+    # State variables
+    stream_sid = None
+    
+    async def process_and_reply(human_text):
+        nonlocal stream_sid
+        if not stream_sid:
+            return
+
+        print(f"Human said: {human_text}")
+
+        # A. Generate Text with Groq
+        try:
+            chat_completion = groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": human_text}
+                ],
+                model="llama-3.1-8b-instant",
+                max_tokens=50,
+            )
+            ai_response = chat_completion.choices[0].message.content
+            print(f">> Bob thinks: {ai_response}")
+
+        except Exception as e:
+            print(f"Groq Error: {e}")
+            return
+
+        # B. Generate Audio with Deepgram
+        try:
+            # Request Raw Mulaw 
+            options = SpeakOptions(
+                model="aura-asteria-en", # or aura-helios-en for male
+                encoding="mulaw",
+                sample_rate=8000,
+                container="none"
+            )
+            
+            res = deepgram.speak.v("1").stream({"text": ai_response}, options)
+            
+            # Extract raw bytes
+            audio_data = None
+            if hasattr(res, "stream"):
+                audio_data = res.stream.getvalue()
+            else:
+                audio_data = res
+
+            if audio_data:
+                # Safety Header Strip
+                if audio_data[:4] == b'RIFF':
+                    audio_data = audio_data[44:]
+
+                # CHUNKING: 160 bytes = 20ms @ 8000Hz
+                chunk_size = 160 
+                
+                for i in range(0, len(audio_data), chunk_size):
+                    chunk = audio_data[i:i+chunk_size]
+                    
+                    base64_audio = base64.b64encode(chunk).decode("utf-8")
+                    media_message = {
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {
+                            "payload": base64_audio
+                        }
+                    }
+                    
+                    await websocket.send_text(json.dumps(media_message))
+                    
+                    # PACING: Wait 20ms to match phone line speed
+                    await asyncio.sleep(0.020)
+
+                # Mark Complete 
+                mark_message = {
+                     "event": "mark",
+                     "streamSid": stream_sid,
+                     "mark": {
+                         "name": "reply_complete"
+                     }
+                }
+                await websocket.send_text(json.dumps(mark_message))
+                
+                print(">> Sent audio reply (Real Voice).")
+
+        except Exception as e:
+            print(f"TTS Error: {e}")
+
+    # ----------------------------------------------------
+
     try:
         dg_connection = deepgram.listen.live.v("1")
         
-        # Define what happens when Deepgram hears text
+        # Define the callback
         def on_message(self, result, **kwargs):
             sentence = result.channel.alternatives[0].transcript
             if len(sentence) > 0:
-                print(f"Human said: {sentence}")
+                
+                asyncio.run_coroutine_threadsafe(process_and_reply(sentence), loop)
 
-        # Hook up the event listener
         dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
 
-        # Configure Deepgram model and other parameters
         options = LiveOptions(
             model="nova-2", 
             language="en-US", 
-            smart_format=True,
-            encoding="mulaw", # Twilio sends 'mulaw' encoding
-            sample_rate=8000  # Phone lines are 8000Hz
+            smart_format=True, 
+            encoding="mulaw", 
+            sample_rate=8000,
+            endpointing=300 # Wait 300ms of silence before sending transcript
         )
 
-        # Start the Deepgram connection
         if dg_connection.start(options) is False:
             print("Failed to start Deepgram connection")
             return
@@ -229,16 +322,17 @@ async def websocket_endpoint(websocket: WebSocket):
         print(">> Deepgram is ready and listening.")
 
         while True:
-            # Receive data from Twilio
             message = await websocket.receive_text()
             data = json.loads(message)
 
-            if data['event'] == 'media':
-                # Extract raw audio
+            if data['event'] == 'start':
+                # Capture the Stream SID so we know where to send audio back
+                stream_sid = data['start']['streamSid']
+                print(f">> Stream Started! SID: {stream_sid}")
+
+            elif data['event'] == 'media':
                 media_payload = data['media']['payload']
-                # Decode base64 to bytes
                 audio_data = base64.b64decode(media_payload)
-                # Send to Deepgram
                 dg_connection.send(audio_data)
 
             elif data['event'] == 'stop':
@@ -249,7 +343,14 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"Error: {e}")
     
     finally:
-        # Cleanup
         await websocket.close()
         dg_connection.finish()
         print(">> Connection closed.")
+
+# Load Groq Client
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+if not os.getenv("GROQ_API_KEY"):
+    raise ValueError("Groq API Key missing")
+
+# System Prompt
+SYSTEM_PROMPT = "You are a suspicious elderly woman named 'Annie'. You are talking on the phone. You are skeptical of whoever calls you. Keep your responses short (under 10 words) and slightly rude."
